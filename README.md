@@ -27,52 +27,11 @@ By default, the action auto-detects which provider to use:
 - If `anthropic-api-key` is provided, uses Anthropic
 - Otherwise, falls back to tiktoken
 
-### Multi-Provider Baselines (Recommended)
+## Recommended Setup: Compare Against the PR's Base Commit
 
-To ensure consistent comparisons across all environments (including forks without API keys), use `all-providers: true` when generating baselines. This creates a baseline containing token counts from both providers, so comparisons always use matching providers.
+Build and count the PR's base commit in the same job, and use that as the baseline. This compares every PR against the branch it will actually merge into (including release or stacked branches), needs no separate baseline workflow or artifacts, and both sides are always counted by the same provider.
 
-## Recommended Setup: Multi-Provider Artifact Baseline
-
-### Step 1: Create baseline workflow (`.github/workflows/token-baseline.yml`)
-
-This runs on pushes to main and stores a multi-provider baseline as an artifact:
-
-```yaml
-name: Update Token Baseline
-
-on:
-  push:
-    branches: [main]
-  workflow_dispatch:
-
-jobs:
-  baseline:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build server
-        run: make build
-
-      - name: Generate multi-provider baseline
-        uses: sd2k/mcp-tokens-action@v1
-        with:
-          command: ./dist/my-server
-          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
-          all-providers: true
-          output: token-baseline.json
-
-      - name: Upload baseline artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: token-baseline
-          path: token-baseline.json
-          retention-days: 90
-```
-
-### Step 2: Create PR check workflow (`.github/workflows/token-check.yml`)
-
-This runs on PRs and compares against the matching provider in the baseline:
+`.github/workflows/token-check.yml`:
 
 ```yaml
 name: Token Analysis
@@ -84,38 +43,51 @@ jobs:
   analyze:
     runs-on: ubuntu-latest
     permissions:
-      pull-requests: write
+      contents: read
+      pull-requests: write # only needed for `comment: true`
     steps:
       - uses: actions/checkout@v4
 
       - name: Build server
         run: make build
 
-      - name: Download baseline
-        id: download-baseline
-        uses: dawidd/action-download-artifact@v6
+      - name: Check out base
+        uses: actions/checkout@v4
         with:
-          workflow: token-baseline.yml
-          branch: main
-          name: token-baseline
-          path: baseline
-          if_no_artifact_found: warn
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+
+      - name: Build base server
+        working-directory: base
+        run: make build
+
+      - name: Count base tokens
+        uses: sd2k/mcp-tokens-action@v1
+        with:
+          command: ./base/dist/my-server
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          output: base-tokens.json
 
       - name: Analyze tokens
         uses: sd2k/mcp-tokens-action@v1
         with:
           command: ./dist/my-server
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
-          baseline: ${{ steps.download-baseline.outputs.found_artifact == 'true' && 'baseline/token-baseline.json' || '' }}
+          baseline: base-tokens.json
           threshold-percent: "5"
           comment: true
           github-token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
-With this setup:
-- Main repo PRs with API key: compares Anthropic vs Anthropic baseline
-- Fork PRs without API key: compares tiktoken vs tiktoken baseline
-- Both get accurate, like-for-like comparisons
+Both steps get the same key, so they use the same provider:
+- Main repo PRs with an API key: Anthropic vs Anthropic
+- Fork PRs, where secrets are unavailable: tiktoken vs tiktoken
+
+Fork PRs also get a read-only `GITHUB_TOKEN`, so `comment: true` can't post on them. If fork contributors matter to you, write the action's outputs to `$GITHUB_STEP_SUMMARY` instead.
+
+### Stored baselines
+
+If you'd rather store a baseline (e.g. as an artifact from `main`) than rebuild the base on every PR, generate it with `all-providers: true`. The file then holds counts from both providers, so a PR is always compared against the provider it's using. Be aware that looking up "the latest artifact on main" through GitHub's API can occasionally return an old run, and it always compares against `main` whatever the PR's base branch is.
 
 ## Inputs
 
